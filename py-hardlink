@@ -112,7 +112,7 @@ if umsg:
 argv    = args
 argv    = [ '.' ] if len(argv) == 0 else argv
 
-dsuffix = ".hardlink.dst"
+dsuffix = ".py-hardlink.dst"
 dr_msg  = " (dry run)" if dry_run else ""
 
 # ###################################################################
