@@ -1,0 +1,340 @@
+#!/usr/bin/env python
+
+# ###################################################################
+# Find duplicate files and hard link them together...
+#
+# We do an MD5 hash of candidate files' contents, *and* a SHA256 hash; so the
+# probability of a false positive is vanishingly small
+#
+# Exceptions:
+#   - exclude small files, under 1024 bytes (by default)
+#   - never follow symbolic links
+#
+# Filters:
+#   - only consider groups of files on the same mount point
+#   - only consider groups of files of the same size
+#   - only consider groups of files with the same MD5 hash
+#   - only consider groups of files with the same SHA256 hash
+#
+# Opimisation:
+#   - if several files within a group share the same inode, then just keep one
+#     representative; so we never hash the same file twice, and we filter out
+#     files which have already been hard linked together; all of which can
+#     speed things up significantly
+# 
+# When creating links:
+#   - use the oldest of the group (by modification time) as the source
+#   - so, we get:
+#     - the oldest file's timestamps
+#     - the oldest file's permissions
+#     - the oldest file's owner and group
+#     - and so on
+#
+# Usage:
+#   - py-hardlink -h
+#
+# Notes:
+#   - known to work with
+#     - python 2.6.8
+#     - python 2.7.3
+#
+#   - there are syntax errors with python3
+#     - and I haven't looked into the differences between the two
+#
+
+# ###################################################################
+# imports...
+
+import sys
+import os
+import hashlib
+import getopt
+import pprint
+
+# ###################################################################
+# usage...
+
+usage_message = """
+usage: py-hardlink [-h] [-n] [-q] [-s SMALL] [file or directories...]
+   -h: output this help message and exit
+   -n: dry run
+   -q: suppress messages about ongoing hash operations
+   -s SMALL: ignore files smalled that SMALL (bytes); default 1024
+""".strip()
+
+def usage(error):
+   output = sys.stderr if 0 < error else sys.stdout
+   output.write(usage_message + "\n")
+   sys.exit(error)
+
+# ###################################################################
+# globals, options...
+
+show      = pprint.PrettyPrinter(indent=2).pprint
+isfile    = os.path.isfile
+islink    = os.path.islink
+isdir     = os.path.isdir
+path_join = os.path.join
+abspath   = os.path.abspath
+realpath  = os.path.realpath
+dirname   = os.path.dirname
+
+dry_run   = False
+quiet     = False
+umsg      = False
+small     = 1024
+
+success   = {}
+failed    = {}
+skipped   = {}
+
+try:
+   optlist, args = getopt.getopt(sys.argv[1:], 'hnqs:')
+   for o, a in optlist:
+      if o == '-h':
+         umsg = True
+      if o == '-n':
+         dry_run = True
+      if o == '-q':
+         quiet = True
+      if o == '-s':
+         try:
+            small = int(a)
+         except:
+            sys.stderr.write("error: invalid -s value: " + a + "\n")
+            sys.exit(1)
+except:
+   usage(1)
+
+if umsg:
+   usage(0)
+
+argv    = args
+argv    = [ '.' ] if len(argv) == 0 else argv
+
+dsuffix = ".hardlink.dst"
+dr_msg  = " (dry run)" if dry_run else ""
+
+# ###################################################################
+# utilities...
+
+def append(l,e):
+   l.append(e)
+   return l
+
+def extend(d,k,v):
+   d[k] = append(d[k],v) if k in d else [v]
+
+# source...
+# (somewhere on Stack Overflow; sorry, can't find it again)
+def deduplicate(seq):
+   seen = set()
+   seen_add = seen.add
+   return [ x for x in seq if x not in seen and not seen_add(x) ]
+
+# source...
+# http://stackoverflow.com/questions/3431825/python-generating-a-md5-checksum-of-a-file
+def hashfile(afile, hasher, blocksize=65536):
+   buf = afile.read(blocksize)
+   while len(buf) > 0:
+      hasher.update(buf)
+      buf = afile.read(blocksize)
+   return hasher.hexdigest()
+
+def md5sum(f):
+   if not quiet:
+      print "md5:    " + name(f)
+   return hashfile(open(name(f), 'rb'), hashlib.md5())
+
+def sha256(f):
+   if not quiet:
+      print "sha256: " + name(f)
+   return hashfile(open(name(f), 'rb'), hashlib.sha256())
+
+def group_by(seq, func):
+   groups = {}
+   for val in seq:
+      extend(groups,func(val),val)
+   #
+   return groups
+
+def show_groups(msg,groups):
+   print msg + ":"
+   if 0 < len(groups.keys()):
+      for key in groups.keys():
+         print key + ":"
+         for val in groups[key]:
+            print "  <- " + val
+   else:
+      print "  (none)"
+
+# ###################################################################
+# syntactic sugar...
+
+def stat(f):
+   return f['stat']
+
+def name(f):
+   return f['name']
+
+def isdir_or_isfile(f):
+   if isdir(f):
+      return True
+   if isfile(f) and not islink(f):
+      return True
+   return False
+
+def not_isdir_or_isfile(f):
+   return not isdir_or_isfile(f)
+
+# ###################################################################
+# collect all files...
+
+def hardlink_sources(args):
+   #
+   errors = filter(not_isdir_or_isfile, args)
+   if 0 < len(errors):
+      for arg in errors:
+         sys.stderr.write("error: not a directory or a file: " + arg + "\n")
+      #
+      sys.exit(1)
+   #
+   files = filter(isfile, args)
+   #
+   for d in filter(isdir, args):
+      for root, ds, fs in os.walk(d):
+         files.extend( [ path_join(root,f) for f in fs ] )
+   #
+   files = [ f for f in files if not f.endswith(dsuffix) ]
+   files = [ realpath(abspath(f)) for f in files if isfile(f) and not islink(f) ]
+   files = [ { 'name': f, 'stat': os.stat(f) } for f in deduplicate(files) ]
+   #
+   hardlink_sizes(files)
+
+# ###################################################################
+# group files of equal size...
+
+def hardlink_sizes(fs):
+   if 1 < len(fs):
+      for fs in group_by(fs, lambda f: stat(f).st_size).values():
+         if small <= stat(fs[0]).st_size:
+            hardlink_mounts(fs)
+
+# ###################################################################
+# group files by mount point...
+
+def hardlink_mounts(fs):
+   if 1 < len(fs):
+      map(hardlink_inodes, group_by(fs, lambda f: stat(f).st_dev).values())
+
+# ###################################################################
+# keep just one representative for each inode...
+
+def hardlink_inodes(fs):
+   if 1 < len(fs):
+      hardlink_md5( [ same[0] for same in group_by(fs, lambda f: stat(f).st_ino).values() ] )
+
+# ###################################################################
+# group by md5 hash...
+
+def hardlink_md5(fs):
+   if 1 < len(fs):
+      map(hardlink_sha256, group_by(fs, md5sum).values())
+
+# ###################################################################
+# group by sha256 hash...
+
+def hardlink_sha256(fs):
+   if 1 < len(fs):
+      map(hardlink_oldest, group_by(fs, sha256).values())
+
+# ###################################################################
+# choose oldest as source, others as destinations...
+
+def hardlink_oldest(fs):
+   if 1 < len(fs):
+      fs.sort(key=lambda f: stat(f).st_mtime)
+      #
+      progress = {}
+      for dst in fs[1:]:
+         if hardlink_link(fs[0],dst):
+            extend(progress,name(fs[0]),name(dst))
+      #
+      if 0 < len(progress):
+         show_groups("progress" + dr_msg, progress)
+
+# ###################################################################
+# do linking...
+
+def hardlink_link(src,dst):
+   src = name(src)
+   dst = name(dst)
+   dst_tmp = dst + dsuffix
+   #
+   if not os.access(dirname(dst), os.W_OK):
+      sys.stderr.write("error: skipping file in unwritable directory: " + dst + "\n")
+      extend(skipped,dirname(dst),dst)
+      return False
+   #
+   if os.path.exists(dst_tmp):
+      sys.stderr.write("error: skipping file because backup path exists: " + dst_tmp + "\n")
+      extend(skipped,dirname(dst),dst)
+      return False
+   #
+   try:
+      if not dry_run:
+         #
+         # backup dst...
+         os.rename(dst,dst_tmp)
+         #
+         # install new link...
+         try:
+            os.link(src,dst)
+         except:
+            #
+            # put backup back where it came from (if we can)...
+            os.rename(dst_tmp,dst)
+            raise
+         #
+         # unlink backup...
+         os.unlink(dst_tmp)
+      #
+      extend(success,src,dst)
+   except:
+      sys.stderr.write("link failed: " + dst + " <- " + src + "\n")
+      if os.path.isfile(dst_tmp):
+         sys.stderr.write("still exists: " + dst_tmp + "\n")
+      extend(failed,src,dst)
+      return False
+   #
+   return True
+
+# ###################################################################
+# main...
+
+hardlink_sources(argv)
+
+# ###################################################################
+# reporting...
+
+error = 0
+
+if 0 < len(success.keys()):
+   print "-------------------------------------------"
+   show_groups("linked" + dr_msg, success)
+
+if 0 < len(skipped):
+   print "-------------------------------------------"
+   show_groups("skipped" + dr_msg, skipped)
+   error = 1
+
+if 0 < len(failed.keys()):
+   print "-------------------------------------------"
+   show_groups("errors" + dr_msg, failed)
+   error = 1
+
+# ###################################################################
+# done...
+
+sys.exit(error)
+
